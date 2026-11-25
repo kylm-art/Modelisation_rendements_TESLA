@@ -10,14 +10,17 @@ knitr::opts_chunk$set(echo = TRUE)
 
 #Importation des données
 ```{r}
-install.packages("quantmod")
+#install.packages("quantmod")
 library(quantmod)
 
 # Tickers : "TSLA", "NVDA", "BTC-USD", "MRNA", "URTH" (ETF MSCI World)
 ticker <- "TSLA"
 df <- getSymbols(ticker, src = "yahoo", from = "2015-01-01",
                  to = "2026-11-23", auto.assign = FALSE)
+```
 
+
+```{r}
 prix <- Ad(df)  # prix ajusté (splits et dividendes)
 rendements <- na.omit(diff(log(prix)))  # rendements log, base des GARCH
 
@@ -25,10 +28,20 @@ print(tail(df))
 cat("Volatilité annuelle :", round(sd(rendements) * sqrt(252) * 100, 1), "%\n")
 
 write.zoo(df, paste0(ticker, ".csv"), sep = ",")  # sauvegarde locale
+```
 
+
+```{r}
 par(mfrow = c(2, 1))
 plot(as.zoo(prix), log = "y", main = paste("Prix", ticker), xlab = "", ylab = "")
 plot(as.zoo(rendements), main = "Rendements log", xlab = "", ylab = "")
 par(mfrow = c(1, 1))
+```
+
+
+### Aperçcu de la base de données
+
+```{r}
+
 ```
 

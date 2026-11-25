@@ -3,3 +3,264 @@ title: "test"
 format: html
 ---
 
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+#Importation des données
+```{r}
+#install.packages("quantmod")
+library(quantmod)
+
+# Tickers : "TSLA", "NVDA", "BTC-USD", "MRNA", "URTH" (ETF MSCI World)
+ticker <- "TSLA"
+df <- getSymbols(ticker, src = "yahoo", from = "2015-01-01",
+                 to = "2026-11-23", auto.assign = FALSE)
+```
+
+
+```{r}
+prix <- Ad(df)  # prix ajusté (splits et dividendes)
+rendements <- na.omit(diff(log(prix)))  # rendements log, base des GARCH
+
+print(tail(df))
+cat("Volatilité annuelle :", round(sd(rendements) * sqrt(252) * 100, 1), "%\n")
+
+write.zoo(df, paste0(ticker, ".csv"), sep = ",")  # sauvegarde locale
+```
+
+
+```{r}
+par(mfrow = c(2, 1))
+plot(as.zoo(prix), log = "y", main = paste("Prix", ticker), xlab = "", ylab = "")
+plot(as.zoo(rendements), main = "Rendements log", xlab = "", ylab = "")
+par(mfrow = c(1, 1))
+
+ts.plot(df$TSLA.Close)
+```
+
+
+### Aperçcu de la base de données
+
+```{r}
+n <- nrow(rendements)
+```
+
+
+## Box & Kekkins
+
+```{r}
+library(tseries)
+```
+
+
+```{r}
+ts.plot(rendements)
+```
+
+
+```{r}
+acf(rendements)
+pacf(rendements)
+
+rendements_squarred <- rendements^2
+
+acf(rendements_squarred)
+pacf(rendements_squarred)
+
+Box.test(X_t, lag = 10, type = "Ljung-Box") # H0 correspondant à l'absence d'aUto-corr
+```
+### Commentaires: 
+> les log-rendements (X_t) de notre TSLA se comporte comment un bruit blanc. Car l'acf présente des lag
+décorelés.
+
+> Les log-rendements au carré nous révolelle une fonction ACF présentant des auto-corrélation, on conclut donc
+que notre serie log-rendements se comporte comme un Bruit blanc faible.
+
+
+
+```{r}
+#install.packages("weakARMA")
+library(weakARMA)
+```
+
+
+## Modélisation 1: X_t suit un GARCH
+
+
+
+```{r}
+# ==============================================================================
+# MODÉLISATION GARCH(p, q) D'UNE SÉRIE TEMPORELLE X_t (Bruit blanc faible)
+# ==============================================================================
+
+# 1. Installation et chargement des packages nécessaires
+packages <- c("rugarch", "FinTS", "tseries", "forecast")
+new_packages <- packages[!(packages %in% installed.packages()[,"Package"])]
+if(length(new_packages)) install.packages(new_packages)
+
+library(rugarch)   # Modélisation GARCH complète et robuste
+library(FinTS)     # Test ARCH-LM (Engle)
+library(tseries)   # Tests de stationnarité et normalité (Jarque-Bera)
+library(forecast)  # Visualisation ACF / PACF
+```
+
+
+```{r}
+X_t <- rendements
+```
+
+
+```{r}
+# Test d'Engle (ARCH-LM) pour confirmer la présence d'hétéroscédasticité conditionnelle
+arch_test <- ArchTest(X_t, lags = 12)
+print(arch_test)
+```
+Ce test nous révelle effectivement que nous somme en présence d'une série présentant
+une variance conditionnelle dépendante du temps.
+
+
+```{r}
+# identifier p_max et q_max
+par(mfrow = c(1, 2))
+Acf(rendements_squarred, main = expression(paste("ACF de ", X[t]^2)), lag.max = 20)
+Pacf(rendements_squarred, main = expression(paste("PACF de ", X[t]^2)), lag.max = 20)
+par(mfrow = c(1, 1))
+```
+L'ACF et PACF ne présentant de forme assez sympa, on choisie des valeurs parcimonieuses pour p_max et q_max
+
+```{r}
+
+p_max <- 2
+q_max <- 2
+
+# Tableau pour stocker les résultats
+resultats <- data.frame(
+  p = integer(),
+  q = integer(),
+  AIC = numeric(),
+  BIC = numeric(),
+  LogLik = numeric(),
+  LB_std_pval = numeric(),   # Ljung-Box sur résidus standardisés
+  LB_sq_pval = numeric(),    # Ljung-Box sur résidus standardisés au carré
+  ARCH_LM_pval = numeric(),  # Test ARCH-LM résiduel
+  Signif_Params = logical(), # Tous les paramètres sont-ils significatifs ?
+  stringsAsFactors = FALSE
+)
+
+cat("Recherche du meilleur modèle GARCH(p, q) en cours...\n")
+
+for (p in 1:p_max) {      # p >= 1 requis pour avoir un effet ARCH/GARCH
+  for (q in 0:q_max) {    # q = 0 correspond à un modèle ARCH(p)
+    
+    # Spécification du modèle (moyenne nulle car X_t est un bruit blanc faible)
+    # Note : "std" (Student-t) est souvent préféré à "norm" en finance, adaptable selon le cas
+    spec <- ugarchspec(
+      variance.model = list(model = "sGARCH", garchOrder = c(p, q)),
+      mean.model = list(armaOrder = c(0, 0), include.mean = FALSE),
+      distribution.model = "norm" 
+    )
+    
+    # Estimation avec gestion des erreurs de convergence
+    fit <- tryCatch(
+      ugarchfit(spec = spec, data = X_t, solver = "hybrid"),
+      error = function(e) NULL,
+      warning = function(w) NULL
+    )
+    
+    # Vérification de la convergence
+    if (!is.null(fit) && convergence(fit) == 0) {
+      
+      # Critères d'information
+      ic <- infocriteria(fit)
+      aic_val <- ic[1]
+      bic_val <- ic[2]
+      
+      # Extraction des résidus standardisés (z_t = X_t / sigma_t)
+      z_t <- as.numeric(residuals(fit, standardize = TRUE))
+      
+      # Tests diagnostics sur les résidus standardisés (lag = 10)
+      lb_std <- Box.test(z_t, lag = 10, type = "Ljung-Box")$p.value
+      lb_sq  <- Box.test(z_t^2, lag = 10, type = "Ljung-Box")$p.value
+      arch_r <- ArchTest(z_t, lags = 10)$p.value
+      
+      # Vérification de la significativité des coefficients (p-value < 0.05)
+      pvals <- fit@fit$matcoef[, 4]
+      all_signif <- all(pvals < 0.05)
+      
+      # Enregistrement
+      resultats <- rbind(resultats, data.frame(
+        p = p,
+        q = q,
+        AIC = aic_val,
+        BIC = bic_val,
+        LogLik = likelihood(fit),
+        LB_std_pval = lb_std,
+        LB_sq_pval = lb_sq,
+        ARCH_LM_pval = arch_r,
+        Signif_Params = all_signif
+      ))
+    }
+  }
+}
+
+# ==============================================================================
+# 5. FILTRAGE ET SÉLECTION DU MODÈLE OPTIMAL
+# ==============================================================================
+# Un modèle valide doit :
+# 1. Avoir des résidus standardisés non corrélés (LB_std_pval > 0.05)
+# 2. Ne plus présenter d'effet ARCH (LB_sq_pval > 0.05 et ARCH_LM_pval > 0.05)
+# 3. Idéalement avoir tous ses paramètres significatifs (Signif_Params == TRUE)
+
+modeles_valides <- subset(resultats, LB_sq_pval > 0.05 & ARCH_LM_pval > 0.05 & Signif_Params == TRUE)
+
+# Si aucun modèle ne respecte strictement la significativité totale, on relâche cette contrainte
+if (nrow(modeles_valides) == 0) {
+  cat("Aucun modèle avec tous les paramètres strictement significatifs. Relâchement du critère...\n")
+  modeles_valides <- subset(resultats, LB_sq_pval > 0.05 & ARCH_LM_pval > 0.05)
+}
+
+# Tri par critère BIC croissant (plus parcimonieux que l'AIC)
+modeles_valides <- modeles_valides[order(modeles_valides$BIC), ]
+
+print("--- TABLEAU RÉCAPITULATIF DES MODÈLES VALIDES ---")
+print(modeles_valides)
+
+# Sélection du meilleur couple (p_opt, q_opt)
+p_opt <- modeles_valides$p[1]
+q_opt <- modeles_valides$q[1]
+
+cat(sprintf("\n>>> MEILLEUR MODÈLE SÉLECTIONNÉ : GARCH(%d, %d) <<<\n", p_opt, q_opt))
+
+# ==============================================================================
+# 6. ESTIMATION FINALE ET DIAGNOSTICS COMPLETS DU MEILLEUR MODÈLE
+# ==============================================================================
+best_spec <- ugarchspec(
+  variance.model = list(model = "sGARCH", garchOrder = c(p_opt, q_opt)),
+  mean.model = list(armaOrder = c(0, 0), include.mean = FALSE),
+  distribution.model = "norm"
+)
+
+best_fit <- ugarchfit(spec = best_spec, data = X_t)
+
+# Affichage complet (paramètres, tests de Ljung-Box, ARCH-LM, Nyblom, Sign Bias)
+show(best_fit)
+
+# Extraction des résidus standardisés pour diagnostics graphiques
+z_best <- as.numeric(residuals(best_fit, standardize = TRUE))
+
+# Test de normalité de Jarque-Bera sur les résidus standardisés
+print(jarque.bera.test(z_best))
+
+# Graphiques de diagnostic
+par(mfrow = c(2, 2))
+plot(best_fit, which = 3)  # Volatilité conditionnelle estimée (sigma_t)
+plot(best_fit, which = 9)  # QQ-Plot des résidus standardisés
+Acf(z_best, main = "ACF des résidus standardisés")
+Acf(z_best^2, main = "ACF des résidus standardisés au carré")
+par(mfrow = c(1, 1))
+```
+
+
+

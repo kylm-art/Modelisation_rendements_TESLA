@@ -1,0 +1,756 @@
+---
+title: "Modélisation FARIMA gaussienne des rendements de TESLA"
+subtitle: "Pipeline modulaire : de l'aperçu des données aux prévisions et à leur validation hors échantillon"
+lang: fr
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-title: "Sommaire"
+    number-sections: true
+    code-fold: true
+    code-tools: true
+    theme: cosmo
+    fig-width: 9
+    fig-height: 5
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+  error: true
+---
+
+```{r}
+#| label: setup
+#| include: false
+knitr::opts_chunk$set(echo = TRUE, fig.align = "center", dpi = 110, out.width = "100%")
+
+# ---- Deux interrupteurs ------------------------------------------------------------------
+MODE_RAPIDE    <- FALSE   # TRUE : grille réduite, bootstrap et backtest allégés (vérifier que tout tourne)
+EXECUTER_TESTS <- FALSE   # TRUE : exécute tests/test_modules.R dans ce rapport (1 à 3 min)
+
+source("R/00_utils.R", encoding = "UTF-8")
+dispo   <- charger_packages()          # vérifie quantmod, xts, zoo, tseries ; signale fracdiff, rugarch
+modules <- sourcer_modules("R")        # charge 01_ ... 10_ dans l'ordre
+set.seed(CONFIG$graine)
+
+# Aides d'affichage
+tab <- function(df, digits = 4, caption = NULL) knitr::kable(arrondir_df(df, digits), caption = caption, row.names = FALSE)
+v   <- function(expr, digits = 3) tryCatch(format(round(expr, digits), nsmall = digits), error = function(e) "NA")
+```
+
+# Objectif, principes et conventions
+
+## Ce que fait ce document
+
+On modélise les **rendements logarithmiques quotidiens de TESLA** par un **FARIMA(p, d, q)** — un ARMA fractionnairement intégré, appelé aussi ARFIMA ou « FARMA » — estimé par **quasi-vraisemblance gaussienne**. Le document suit le déroulé complet d'une étude de séries temporelles, chaque étape étant un module R autonome (`R/01_…` à `R/10_…`) :
+
+| Étape | Module | Question posée |
+|:--|:--|:--|
+| Données | `01_donnees.R` | Les données sont-elles saines (trous, doublons, extrêmes) ? |
+| Exploration | `02_exploration.R` | Stationnarité, queues, corrélation, effets ARCH ? |
+| Mémoire longue | `03_memoire_longue.R` | Existe-t-il une dépendance hyperbolique ($d \neq 0$), dans quelles séries ? |
+| Noyau FARIMA | `04_farima_coeur.R` | Autocovariances exactes, simulation exacte, algèbre du modèle |
+| Estimation | `05_farima_estimation.R` | Quels paramètres $(d, \phi, \theta)$ et avec quelle précision ? |
+| Sélection | `06_selection.R` | Quels ordres $(p, q)$ ? FARIMA ou simple ARMA ? |
+| Diagnostics | `07_diagnostics.R` | Les résidus sont-ils un bruit blanc ? Le modèle colle-t-il au spectre ? |
+| Prévision | `08_prevision.R` | Prévisions, intervalles, trajectoires de prix |
+| Backtest | `09_backtest.R` | Le modèle prévoit-il mieux que des références simples, *hors échantillon* ? |
+| Extensions | `10_extensions.R` | Écarts-types robustes (bootstrap), FARIMA-GARCH, VaR |
+
+Le code des modules n'est pas répété ici : le rapport **appelle** les fonctions et **commente** ce qu'elles produisent. Toutes les briques mathématiques sont vérifiées séparément par `tests/test_modules.R` (§ @sec-tests).
+
+## Le modèle
+
+$$
+\Phi(B)\,(1-B)^d\,(X_t-\mu)=\Theta(B)\,\varepsilon_t ,
+\qquad
+\Phi(B)=1-\sum_{i=1}^p\phi_iB^i,\quad \Theta(B)=1+\sum_{j=1}^q\theta_jB^j,
+$$
+
+où $\varepsilon_t$ est un bruit blanc de variance $\sigma^2$ et
+
+$$
+(1-B)^d=\sum_{j\ge0}\pi_jB^j,\qquad \pi_0=1,\quad \pi_j=\pi_{j-1}\,\frac{j-1-d}{j}.
+$$
+
+Trois propriétés gouvernent toute l'étude :
+
+* **Stationnarité et inversibilité** pour $|d|<1/2$ (et racines de $\Phi$, $\Theta$ hors du disque unité).
+* **Mémoire** : pour $0<d<1/2$ les autocorrélations décroissent *hyperboliquement*, $\rho(h)\sim c\,h^{2d-1}$ (non sommables), alors qu'un ARMA a une décroissance *exponentielle*. Dans le domaine fréquentiel, la densité spectrale a un **pôle en 0** : $f(\lambda)\sim c\,\lambda^{-2d}$.
+* **Antipersistance** pour $-1/2<d<0$ : $f(0)=0$, souvent signe de sur-différenciation.
+
+## Que signifie « gaussien » ici
+
+Le terme renvoie à l'estimation par **quasi-vraisemblance gaussienne**, qui reste **consistante même si le bruit n'est pas gaussien** (condition : $\varepsilon_t$ est un bon bruit blanc). Le pipeline en contient trois variantes, qui se contrôlent mutuellement :
+
+1. **Estimateur gaussien semi-paramétrique** de Robinson (*local Whittle*, GSE) : n'utilise que les basses fréquences, ne postule aucun ARMA.
+2. **Whittle paramétrique** : vraisemblance gaussienne dans le domaine fréquentiel, rapide (FFT).
+3. **MLE gaussien exact** : vraisemblance exacte via l'algorithme de Durbin-Levinson, moyenne $\mu$ profilée par moindres carrés généralisés.
+
+::: {.callout-note}
+## Si vous pensiez à autre chose
+Si « Gauss » désignait pour vous une autre méthode (par exemple un estimateur à bruit non gaussien, ou un filtre particulier), l'architecture le permet : il suffit d'ajouter une fonction d'estimation qui renvoie un objet de classe `farima_fit` (module 05), tout le reste (sélection, diagnostics, prévision, backtest) fonctionne sans changement.
+:::
+
+## Protocole anti-fuite d'information
+
+L'échantillon est coupé en deux : **80 % d'apprentissage** (exploration, choix de $(p,q)$, diagnostics) et **20 % final**, qui n'intervient que dans le backtest. Sans cette coupure, choisir l'ordre sur toute la série puis « prévoir » les derniers mois donnerait une performance trompeuse (*look-ahead bias*).
+
+## Tests du code {#sec-tests}
+
+```{r}
+#| label: tests
+if (EXECUTER_TESTS) source("tests/test_modules.R", encoding = "UTF-8") else
+  cat("Tests non exécutés dans ce rendu (EXECUTER_TESTS = FALSE). Lancer : source('tests/test_modules.R')\n")
+```
+
+Les tests comparent chaque brique à une référence indépendante : intégrale numérique pour les autocovariances ($\gamma(h)=\int f(\lambda)\cos(h\lambda)\,d\lambda$), Cholesky pour la vraisemblance, identité $\pi * \psi = 1$ pour les conventions de signe, simulation à paramètres connus pour les estimateurs, prédicteur linéaire optimal exact pour la prévision.
+
+# Données
+
+## Chargement et contrôle qualité
+
+**Pourquoi.** Une série mal nettoyée contamine tout le reste : un doublon de date crée un rendement nul artificiel, un trou de plusieurs jours crée un rendement « multi-jours », un prix négatif fait échouer le logarithme. Les contrôles ci-dessous **signalent** sans corriger silencieusement.
+
+```{r}
+#| label: donnees
+ohlc <- charger_donnees()          # Yahoo ; repli automatique sur data/TSLA.csv si pas de réseau
+jeu  <- construire_jeu(ohlc)
+cat("Source des données :", jeu$source, "\n")
+qc <- controle_qualite(jeu)
+tab(qc$table)
+```
+
+```{r}
+#| label: extremes
+if (nrow(qc$extremes) > 0) tab(qc$extremes, caption = "Rendements extrêmes (|z| > 5) : à examiner, pas à supprimer automatiquement")
+if (nrow(qc$trous) > 0)    tab(qc$trous,    caption = "Trous de calendrier")
+```
+
+**Lecture.** Les valeurs `ALERTE` doivent être nulles. Les rendements extrêmes de TESLA correspondent en général à de vrais événements (résultats trimestriels, entrée au S&P 500) : on les **conserve**, car les supprimer biaiserait la volatilité et la mémoire ; on veillera simplement à ce qu'ils ne gouvernent pas les estimations (stabilité sur sous-périodes, bootstrap par blocs).
+
+## Aperçu graphique
+
+```{r}
+#| label: apercu
+#| fig-height: 6
+plot_apercu(jeu)
+```
+
+Le prix en échelle logarithmique est non stationnaire (tendance) ; les rendements oscillent autour de zéro avec des **grappes de volatilité** (périodes calmes puis agitées), première trace visuelle d'une dépendance non linéaire.
+
+## Découpage apprentissage / final
+
+```{r}
+#| label: decoupage
+y     <- jeu$y;  dates <- jeu$dates
+sp    <- decouper_echantillon(y, part_test = 0.2)
+y_app <- sp$app; n_app <- sp$n_app; dates_app <- dates[seq_len(n_app)]
+cat(sprintf("n total = %d | apprentissage = %d (%s -> %s) | final = %d (%s -> %s)\n",
+            length(y), n_app, dates[1], dates[n_app], sp$n_test, dates[n_app + 1], tail(dates, 1)))
+```
+
+# Exploration : stationnarité, queues, dépendance
+
+## Statistiques descriptives et normalité
+
+```{r}
+#| label: stats
+tab(stats_descriptives(y_app))
+```
+
+```{r}
+#| label: distribution
+#| fig-height: 4.2
+plot_distribution(y_app)
+```
+
+**Pourquoi c'est important pour un FARIMA gaussien.** Une kurtosis nettement supérieure à 3 et un test de Jarque-Bera rejetant la normalité signifient que le bruit n'est pas gaussien. Cela **ne disqualifie pas** l'estimation gaussienne (quasi-vraisemblance) mais change deux choses : (i) les écarts-types « classiques » deviennent peu fiables (on les recalculera par bootstrap par blocs, § @sec-bootstrap), (ii) les intervalles de prévision gaussiens seront mal calibrés dans les queues.
+
+## Stationnarité
+
+```{r}
+#| label: stationnarite
+tab(tests_stationnarite(y_app))
+```
+
+**Lecture croisée.** ADF et Phillips-Perron testent $H_0$ : racine unitaire ; KPSS teste $H_0$ : stationnarité. Le diagnostic « stationnaire » est solide si ADF/PP **rejettent** et KPSS **ne rejette pas**.
+
+::: {.callout-warning}
+## Limite essentielle
+Ces tests ne distinguent **pas** une série à mémoire courte ($d=0$) d'une série à mémoire longue stationnaire ($0<d<1/2$) : les deux sont « stationnaires ». Il ne faut donc pas conclure de ces tests que $d=0$ ; c'est l'objet de la section suivante.
+:::
+
+## Effets ARCH et autocorrélations
+
+```{r}
+#| label: arch
+tab(rbind(arch_lm(y_app, 5), arch_lm(y_app, 10), arch_lm(y_app, 20)), caption = "Test ARCH-LM d'Engle")
+tab(rbind(ljung_box_multi(y_app, etiquette = "r"), ljung_box_multi(abs(y_app), etiquette = "|r|"),
+          ljung_box_multi(y_app^2, etiquette = "r^2")), caption = "Ljung-Box sur r, |r| et r^2")
+```
+
+```{r}
+#| label: correlogrammes
+#| fig-height: 6
+plot_correlogrammes(y_app, lag.max = 60)
+```
+
+**Comment lire.** On compare trois séries : $r_t$ (moyenne), $|r_t|$ et $r_t^2$ (volatilité). Le schéma classique des actifs financiers est : *rendements faiblement ou pas corrélés*, mais *$|r_t|$ et $r_t^2$ fortement et très durablement corrélés*. Le dernier panneau (400 retards) montre si l'autocorrélation de $|r_t|$ reste significative très loin : c'est la signature visuelle d'une mémoire longue **dans la volatilité**.
+
+## Décroissance exponentielle ou hyperbolique ?
+
+Si $\rho(h)\approx a\,r^h$, le graphique de $\log\rho$ contre $h$ est une droite (mémoire courte). Si $\rho(h)\approx c\,h^{2d-1}$, c'est $\log\rho$ contre $\log h$ qui est une droite, de pente $2d-1$. On compare les deux ajustements (sur les retards à autocorrélation positive).
+
+```{r}
+#| label: decroissance
+#| fig-height: 4
+dec_abs <- decroissance_acf(abs(y_app), 250)
+dec_r   <- decroissance_acf(y_app, 250)
+res_dec <- do.call(rbind, lapply(list(`|r|` = dec_abs, `r` = dec_r), function(d)
+  if (isTRUE(d$ok)) data.frame(points = d$n_points, pente_loglog = d$pente_loglog, d_implicite = d$d_implicite,
+                               R2_hyperbolique = d$r2_hyperbolique, R2_exponentielle = d$r2_exponentielle)
+  else data.frame(points = NA, pente_loglog = NA, d_implicite = NA, R2_hyperbolique = NA, R2_exponentielle = NA)))
+tab(cbind(serie = rownames(res_dec), res_dec))
+plot_decroissance(dec_abs, "|r|")
+```
+
+**Lecture.** Un $R^2$ hyperbolique supérieur au $R^2$ exponentiel, avec $d$ implicite $=(\text{pente}+1)/2$ dans $(0, 0{,}5)$, soutient la mémoire longue. Pour $r_t$ lui-même, trop peu d'autocorrélations sont positives pour que l'exercice ait un sens : c'est déjà une information (pas de dépendance durable dans les rendements bruts).
+
+# Mémoire longue : estimation semi-paramétrique
+
+## Principe
+
+On n'utilise que les $m=\lfloor n^\alpha\rfloor$ plus basses fréquences de Fourier $\lambda_j=2\pi j/n$. Deux estimateurs :
+
+* **GPH** : régression $\log I(\lambda_j)=c-d\,\log\!\big(4\sin^2(\lambda_j/2)\big)+u_j$, écart-type $\sqrt{(\pi^2/6)/\sum_j(\text{reg}_j-\overline{\text{reg}})^2}$.
+* **Local Whittle / GSE gaussien** (Robinson, 1995) : $\hat d=\arg\min_d\ \log\!\Big(\tfrac1m\sum_j\lambda_j^{2d}I_j\Big)-\tfrac{2d}{m}\sum_j\log\lambda_j$, avec $\sqrt m(\hat d-d)\to\mathcal N(0,1/4)$.
+
+Aucun ne postule de modèle ARMA : ils sont **robustes à la dynamique courte**, mais plus variables que l'estimation paramétrique.
+
+## Périodogramme
+
+```{r}
+#| label: periodogramme
+#| fig-height: 4.5
+plot_periodogramme(y_app, titre = "des rendements r")
+plot_periodogramme(abs(y_app), titre = "de la volatilité |r|")
+```
+
+**Lecture.** Avec une mémoire longue, le log-périodogramme **remonte** vers les basses fréquences (pente $-2d<0$ en $\log\lambda$). Pour un bruit blanc il est plat. La droite rouge est l'ajustement GPH sur les $m$ fréquences utilisées (points bleus).
+
+## Tableau de synthèse des estimateurs de $d$ (rendements)
+
+```{r}
+#| label: d-semi
+tab(resume_memoire_longue(y_app))
+```
+
+```{r}
+#| label: lo
+tab(test_lo_rs(y_app), caption = "Test R/S modifié de Lo (H0 : mémoire courte)")
+```
+
+**Lecture.** (i) Les estimateurs spectraux (GPH, Whittle local) fournissent un écart-type et donc un test de $d=0$ ; (ii) les estimateurs temporels (Hurst R/S, DFA, variance agrégée) n'en fournissent pas et sont biaisés sur échantillon fini (le R/S surestime $H$ ; DFA est plus fiable) : ils ne servent que de **recoupement qualitatif** ; (iii) le test de Lo corrige le R/S de l'autocorrélation courte (variance de long terme à noyau de Bartlett) et rejette la mémoire courte si la statistique sort de $[0{,}809 ; 1{,}862]$ à 5 %. Concordance entre méthodes = confiance ; désaccord = prudence.
+
+```{r}
+#| label: verdict-d-r
+#| results: asis
+lw <- est_local_whittle(y_app, CONFIG$alpha_bande)
+cat("**Lecture automatique (Whittle local, rendements) :** ", interpreter_d(lw$d, lw$se), "\n")
+```
+
+## Sensibilité à la bande passante
+
+Si $m$ est trop petit, l'estimateur est bruité ; s'il est trop grand, la dynamique courte biaise l'estimation. Une estimation **crédible** doit être relativement stable quand $\alpha$ varie.
+
+```{r}
+#| label: scan
+#| fig-height: 4.2
+sc_r <- scan_bande_passante(y_app); sc_a <- scan_bande_passante(abs(y_app))
+plot_scan_d(sc_r, "(rendements)")
+plot_scan_d(sc_a, "(|r|)")
+```
+
+## Quelle série porte la mémoire longue ?
+
+La théorie financière usuelle (hypothèse d'efficience, au moins faible) prédit : **pas de mémoire longue dans les rendements, mais une mémoire longue dans la volatilité**. On le teste en estimant $d$ sur $r$, $|r|$, $r^2$ et $\log|r|$.
+
+```{r}
+#| label: transformations
+mem_tr <- memoire_transformations(y_app)
+tab(mem_tr)
+```
+
+**Conséquence pour la modélisation.** Si $d$ n'est pas significatif sur $r$ mais l'est nettement sur $|r|$, alors :
+
+* un FARIMA sur les **rendements** doit se réduire, en pratique, à un ARMA (ou à un bruit blanc) : on le **vérifie** plus bas par un test formel ($d=0$) et par le backtest ;
+* le FARIMA devient utile sur la **volatilité** (§ @sec-vol) ou comme moyenne conditionnelle d'un modèle FARIMA-GARCH.
+
+C'est un résultat **à constater**, pas à présupposer : le pipeline est écrit pour le trancher quel que soit le sens.
+
+## Mémoire longue réelle ou artificielle ?
+
+Des **ruptures** de moyenne ou de variance imitent une mémoire longue (le périodogramme s'élève aux basses fréquences). Test pratique : estimer $d$ sur des **fenêtres glissantes**. Un $d$ stable d'une fenêtre à l'autre soutient une propriété structurelle ; un $d$ qui n'apparaît que dans les fenêtres contenant un épisode extrême (2020 par exemple) est suspect.
+
+```{r}
+#| label: stabilite-d
+#| fig-height: 4
+dg_r <- d_glissant(y_app, dates_app, largeur = 1000, pas = 250)
+dg_a <- d_glissant(abs(y_app), dates_app, largeur = 1000, pas = 250)
+plot_d_glissant(dg_r, "(r)"); plot_d_glissant(dg_a, "(|r|)")
+tab(cbind(serie = "r", dg_r[, c("date_debut", "date_fin", "d", "se")]), caption = "d glissant, rendements")
+tab(cbind(serie = "|r|", dg_a[, c("date_debut", "date_fin", "d", "se")]), caption = "d glissant, valeur absolue")
+```
+
+# Estimation paramétrique du FARIMA gaussien
+
+## Deux estimateurs gaussiens
+
+**Whittle.** Avec $I_j=|\sum_tx_te^{-i\lambda_jt}|^2/n$ et $g(\lambda;\eta)=|\Theta(e^{-i\lambda})|^2|\Phi(e^{-i\lambda})|^{-2}(2\sin\tfrac\lambda2)^{-2d}$ (forme spectrale, $\sigma^2$ concentré) :
+$$
+\hat\eta=\arg\min_\eta\ \log\Big(\tfrac1m\sum_j\tfrac{I_j}{g_j(\eta)}\Big)+\tfrac1m\sum_j\log g_j(\eta),\qquad \hat\sigma^2=\tfrac1m\sum_j\tfrac{I_j}{g_j(\hat\eta)} .
+$$
+
+**MLE exact.** $-2\ell=n\log2\pi\hat\sigma^2+\sum_t\log v_t+n$, où $v_t$ sont les variances d'innovation fournies par Durbin-Levinson appliqué aux **autocovariances exactes** du FARIMA (convolution du bruit fractionnaire $\gamma_U$ et de la partie ARMA : $\gamma_X(k)=\sum_h\gamma_{ARMA}(h)\gamma_U(k-h)$). La moyenne est profilée par GLS, ce qui est important : sous mémoire longue la moyenne empirique converge à la vitesse $n^{d-1/2}$, plus lente que $n^{-1/2}$.
+
+**Précision asymptotique** (commune aux deux) : $\widehat{\mathrm{Cov}}(\hat\eta)=2D^{-1}/n$ avec $D=\tfrac1m\sum_j\nabla\log g_j\,\nabla\log g_j^\top$. Cas du bruit fractionnaire pur : $\mathrm{Var}(\hat d)=6/(\pi^2n)$ (vérifié dans les tests).
+
+**Reparamétrisation.** Pour que l'optimiseur ne sorte jamais du domaine admissible, on optimise sur $u\in\mathbb R^k$ avec $d=0{,}49\tanh u_0$, les AR via leurs autocorrélations partielles $\tanh(u_i)$ (stationnarité garantie), les MA par la même transformation (inversibilité garantie).
+
+## Étape 1 : le bruit fractionnaire pur FI(d)
+
+Le plus simple des modèles à mémoire longue (aucun paramètre ARMA) : $d$ est le seul paramètre. Son estimation est le point de comparaison de tout ce qui suit.
+
+```{r}
+#| label: fi-pur
+fit_fi_w <- estim_whittle(y_app, 0, 0)
+fit_fi_e <- estim_mle_exact(y_app, 0, 0, init = fit_fi_w)
+fit_fi_w
+fit_fi_e
+```
+
+**Lecture.** Whittle et MLE exact doivent donner un $d$ voisin (ils sont asymptotiquement équivalents) ; le $d$ paramétrique doit aussi être cohérent avec les estimateurs semi-paramétriques de la section précédente, sans y être identique : le paramétrique « voit » toutes les fréquences, le semi-paramétrique seulement les plus basses.
+
+## Étape 2 : sélection de l'ordre $(p,q)$ sur grille
+
+On estime tous les FARIMA$(p,d,q)$ avec $p\le P$, $q\le Q$ par Whittle (rapide), puis on classe selon le BIC (consistant) ; AIC et HQ sont aussi calculés. Deux garde-fous : la **convergence** et la **proximité des racines AR/MA** (une racine AR quasi égale à une racine MA se simplifie, le modèle est sur-paramétré et ses écarts-types explosent).
+
+```{r}
+#| label: grille-whittle
+#| cache: true
+P <- if (MODE_RAPIDE) 1 else CONFIG$P_max
+Q <- if (MODE_RAPIDE) 1 else CONFIG$Q_max
+grille_w <- grille_farima(y_app, P, Q, "whittle")
+cls <- classer_modeles(grille_w, "BIC")
+tab(cls, caption = "Classement par BIC (delta = écart au meilleur ; delta < 2 : équivalent)")
+```
+
+```{r}
+#| label: grille-graphique
+#| fig-height: 3.8
+plot_grille_critere(grille_w, "BIC")
+```
+
+**Lecture.** La carte indique l'écart de BIC au meilleur modèle (0 en gras). Règle usuelle : $\Delta\text{BIC}<2$ = modèles indiscernables, on choisit le plus **parcimonieux**. Pour des rendements, un BIC qui favorise un très petit ordre est normal : l'information linéaire est faible.
+
+## Étape 3 : FARIMA ou simple ARMA ?
+
+On refait la grille avec $d=0$ imposé. Si le meilleur FARIMA ne bat pas le meilleur ARMA en BIC, la mémoire longue n'apporte rien pour la **moyenne**.
+
+```{r}
+#| label: farima-vs-arma
+#| cache: true
+cmp <- comparer_farima_arma(y_app, P, Q, "whittle", "BIC", g1 = grille_w)
+tab(cmp$table, caption = "Meilleur modèle de chaque famille (BIC)")
+```
+
+## Étape 4 : raffinement par MLE exact des meilleurs candidats
+
+```{r}
+#| label: exact-top
+#| cache: true
+top <- head(cls[!cls$racines_quasi_communes & cls$converge, ], 3)
+fits_exact <- lapply(seq_len(nrow(top)), function(i)
+  estim_mle_exact(y_app, top$p[i], top$q[i], init = grille_w$fits[[sprintf("%d,%d", top$p[i], top$q[i])]]))
+names(fits_exact) <- sprintf("FARIMA(%d,d,%d)", top$p, top$q)
+cmp_exact <- do.call(rbind, lapply(names(fits_exact), function(nm) {
+  f <- fits_exact[[nm]]
+  data.frame(modele = nm, d = f$d, loglik = f$criteres["loglik"], AIC = f$criteres["AIC"], BIC = f$criteres["BIC"],
+             HQ = f$criteres["HQ"], row.names = NULL) }))
+tab(cmp_exact[order(cmp_exact$BIC), ], caption = "Candidats re-estimés par MLE exact")
+fit_ret <- fits_exact[[cmp_exact$modele[which.min(cmp_exact$BIC)]]]
+p_ret <- fit_ret$p; q_ret <- fit_ret$q
+```
+
+**Modèle retenu** (critère BIC exact, parmi les candidats non redondants) :
+
+```{r}
+#| label: retenu
+fit_ret
+```
+
+```{r}
+#| label: verdict-d-ret
+#| results: asis
+cat("**Lecture automatique :** ", interpreter_d(fit_ret$d, fit_ret$coefs$se[fit_ret$coefs$param == "d"]), "\n")
+```
+
+## Étape 5 : le test décisif $d=0$
+
+Deux tests complémentaires : **Wald** (estimation / écart-type asymptotique) et **rapport de vraisemblance exact** entre le FARIMA$(p,d,q)$ et l'ARMA$(p,q)$ de même ordre (statistique $\chi^2_1$, $d=0$ étant un point intérieur de $(-1/2,1/2)$).
+
+```{r}
+#| label: test-d0
+#| cache: true
+fit_arma_ret <- estim_mle_exact(y_app, p_ret, q_ret, d_fixe = 0)
+td0 <- test_d_nul(y_app, p_ret, q_ret, fit_libre = fit_ret, fit_d0 = fit_arma_ret)
+tab(td0, caption = "Test de H0 : d = 0")
+```
+
+**Décision.** Si les deux tests ne rejettent pas, la mémoire longue **de la moyenne** n'est pas établie : le FARIMA se réduit à l'ARMA ajusté (voire à un bruit blanc) et c'est ce dernier qui doit servir à prévoir les rendements. Un rejet signifierait au contraire qu'il existe, dans les rendements eux-mêmes, une dépendance hyperbolique exploitable. Dans les deux cas, la comparaison hors échantillon (§ @sec-backtest) tranche la question qui compte : *est-ce que cela améliore les prévisions ?*
+
+## Étape 6 : contrôles croisés des estimations
+
+```{r}
+#| label: croise
+ctrl <- comparer_estimateurs(y_app, p_ret, q_ret)
+tab(data.frame(estimateur = rownames(ctrl), ctrl, check.names = FALSE))
+```
+
+Trois estimateurs indépendants (Whittle, MLE exact, et `fracdiff` si installé : approximation de vraisemblance de Haslett-Raftery) doivent s'accorder sur $d$ et sur les coefficients AR à quelques centièmes près. **Attention au signe des coefficients MA pour `fracdiff`**, dont la convention peut être opposée ($-\theta$) à celle de ce projet : vérifier avec `?fracdiff` avant de conclure à un désaccord.
+
+Écarts-types : formule asymptotique contre hessienne numérique de la log-vraisemblance exacte (deux calculs indépendants).
+
+```{r}
+#| label: se-comparaison
+#| cache: true
+V_h <- cov_hessienne(fit_ret)
+tab(data.frame(param = fit_ret$coefs$param, estimation = fit_ret$coefs$estimation,
+               se_asymptotique = fit_ret$coefs$se, se_hessienne = sqrt(pmax(diag(V_h), 0))))
+cat("Écart-type de la MOYENNE sous le modèle (mémoire longue prise en compte) :", signif(se_moyenne_modele(fit_ret), 4),
+    "| écart-type naïf sd/sqrt(n) :", signif(sd(y_app) / sqrt(length(y_app)), 4), "\n")
+```
+
+# Diagnostics du modèle retenu
+
+## Le bruit est-il blanc ?
+
+On calcule les **innovations exactes** (Durbin-Levinson : $\hat\varepsilon_t=e_t/\sqrt{v_t}$), qui n'ont pas l'effet de démarrage qu'aurait un filtrage tronqué (important sous mémoire longue, où l'influence du passé s'éteint lentement).
+
+```{r}
+#| label: diag
+diag_ret <- diagnostics_residus(fit_ret, lags = c(10, 20, 40))
+tab(diag_ret$portmanteau, caption = "Portmanteau : Ljung-Box classique (bruit fort) et Lobato (bruit faible)")
+tab(diag_ret$mcleod_li, caption = "McLeod-Li (Ljung-Box sur les résidus au carré) : effet ARCH résiduel")
+tab(diag_ret$arch, caption = "ARCH-LM sur les résidus")
+tab(diag_ret$normalite, caption = "Normalité des résidus")
+```
+
+**Pourquoi deux portmanteaux.** Le Ljung-Box classique suppose un bruit **i.i.d.** ; avec des effets ARCH (bruit faible : non corrélé mais dépendant) il **rejette trop souvent** à tort. Le test de Lobato divise chaque autocovariance par son propre écart-type robuste ($\tau_h=\overline{(\varepsilon_t\varepsilon_{t-h})^2}$) et reste valide. Cas typique : Ljung-Box rejette, Lobato non → l'autocorrélation « apparente » n'est qu'un artefact de la variance conditionnelle.
+
+**Lecture de McLeod-Li et ARCH-LM.** Un rejet net indique une dépendance dans la variance que le FARIMA, qui ne modélise que la moyenne, ne capte pas : c'est attendu pour une action ; on le traite par un GARCH (§ @sec-garch). Cela n'invalide pas la partie moyenne.
+
+```{r}
+#| label: diag-plots
+#| fig-height: 6.5
+plot_diagnostics(fit_ret, diag_ret)
+```
+
+```{r}
+#| label: acf-robuste
+#| fig-height: 4
+plot_acf_robuste(acf_robuste(diag_ret$residus$z, 40), "ACF des résidus (bandes forte et faible)")
+```
+
+La bande **rouge** (bruit faible, Romano-Thombs) est en général plus large que la bande **bleue** (bruit fort) quand la kurtosis est élevée : une autocorrélation qui dépasse la bleue mais pas la rouge n'est pas significative.
+
+## Le spectre ajusté colle-t-il aux données ?
+
+Si le modèle est correct, $R_j=I_j/(\sigma^2g_j)$ se comporte comme des variables exponentielles(1) indépendantes. Le **comportement aux basses fréquences** est le plus informatif : c'est là que se joue la mémoire longue.
+
+```{r}
+#| label: spectral
+#| fig-height: 4.2
+tab(diag_ret$spectral)
+plot_diag_spectral(fit_ret)
+```
+
+## Autocorrélations : modèle contre données
+
+```{r}
+#| label: acf-modele
+#| fig-height: 4
+plot_acf_modele(fit_ret, 100, paste0("FARIMA(", p_ret, ",d,", q_ret, ")"))
+```
+
+## Racines, redondance et stabilité
+
+```{r}
+#| label: racines
+rac <- verifier_racines(fit_ret$ar, fit_ret$ma)
+str(rac)
+```
+
+```{r}
+#| label: stabilite-param
+#| fig-height: 4
+#| cache: true
+pg <- parametres_glissants(y_app, p_ret, q_ret, largeur = 1500, pas = 250, dates = dates_app)
+plot_parametres_glissants(pg)
+```
+
+Des paramètres stables sur des fenêtres de 1500 jours (environ 6 ans) renforcent la confiance ; des sauts reflètent des changements de régime.
+
+## Feuille de contrôle
+
+```{r}
+#| label: feuille
+tab(verifications_modele(fit_ret, diag_ret))
+```
+
+`ECHEC` = à corriger avant toute utilisation ; `ATTENTION` = point à commenter. Un `ATTENTION` sur McLeod-Li (effet ARCH) est attendu pour des rendements et se résout par le modèle de variance.
+
+# Robustesse des écarts-types : bootstrap par blocs {#sec-bootstrap}
+
+Les écarts-types gaussiens supposent des innovations i.i.d. Pour obtenir des écarts-types **honnêtes** sous bruit faible, on rééchantillonne les résidus **par blocs** (longueur $\approx n^{1/3}$), ce qui conserve leur dépendance en variance, on reconstruit une série $x^*=\mu+\sum_j\psi_j\varepsilon^*_{t-j}$, on ré-estime, et on répète $B$ fois.
+
+```{r}
+#| label: bootstrap
+#| cache: true
+bs <- bootstrap_blocs_farima(fit_ret, B = if (MODE_RAPIDE) 40 else 200)
+tab(bs$tab, caption = paste0("Écarts-types asymptotiques et bootstrap par blocs (longueur de bloc = ", bs$longueur_bloc, ")"))
+plot_bootstrap_d(bs, fit_ret$d)
+```
+
+**Lecture.** `ratio_se` $=se_{boot}/se_{asympt}$. Un ratio nettement supérieur à 1 signifie que les écarts-types classiques **sous-estiment** l'incertitude (cas attendu avec une kurtosis élevée) : ce sont alors les intervalles bootstrap qu'il faut utiliser pour les tests sur les paramètres. Le bootstrap tronque le MA($\infty$) (burn-in $=n$) : approximation légère, négligeable sauf pour $d$ proche de 0,5.
+
+# Prévision
+
+## Ré-estimation sur l'échantillon complet
+
+Les ordres $(p,q)$ ayant été choisis sur l'échantillon d'apprentissage, on ré-estime les **paramètres** sur toutes les données pour produire les prévisions opérationnelles.
+
+```{r}
+#| label: fit-final
+#| cache: true
+fit_final <- estim_mle_exact(y, p_ret, q_ret, init = estim_whittle(y, p_ret, q_ret))
+fit_final
+```
+
+## Prévision des rendements
+
+Par la représentation AR($\infty$) : $\hat X_{t+h}=\mu-\sum_{j\ge1}\pi_j(\hat X_{t+h-j}-\mu)$, erreur quadratique $\sigma^2\sum_{j<h}\psi_j^2$.
+
+```{r}
+#| label: prevision
+#| fig-height: 4.5
+pf <- prevoir_farima(fit_final, h = 20)
+tab(pf, digits = 5)
+plot_prevision(fit_final, pf, n_hist = 120, niveau = 95)
+```
+
+**Lecture honnête.** Pour des rendements quotidiens, la prévision de la moyenne est très proche de $\mu$ et l'**intervalle est dominé par $\sigma$** : la plus grande part de l'incertitude est irréductible. Ces intervalles sont **inconditionnels** (même largeur quel que soit le régime de volatilité du moment) ; l'intervalle conditionnel est fourni par le FARIMA-GARCH (§ @sec-garch).
+
+## Vérification de la prévision par le prédicteur exact
+
+Le prédicteur AR($\infty$) tronqué est comparé au **prédicteur linéaire optimal exact** (résolution du système de Toeplitz construit sur les autocovariances exactes) : un écart relatif très petit valide le code de prévision.
+
+```{r}
+#| label: verif-prev
+tab(verifier_prevision(fit_final, h = 10, K = 500), digits = 6)
+```
+
+## Trajectoire de prix
+
+Le prix à l'horizon $h$ est $P_T\exp(\sum_{i\le h}r_{T+i})$ ; la variance de la somme cumulée utilise les poids cumulés $\Psi_m=\sum_{l\le m}\psi_l$.
+
+```{r}
+#| label: prix
+#| fig-height: 4.8
+P0 <- as.numeric(tail(jeu$prix, 1))
+pp <- prevoir_prix(fit_final, P0 = P0, h = 60)
+tab(pp[c(1, 5, 10, 20, 40, 60), ], digits = 2)
+plot_fan_prix(jeu$prix, pp, n_hist = 250)
+```
+
+# Évaluation hors échantillon (backtest) {#sec-backtest}
+
+C'est le juge de paix. Pour chaque jour $t$ du dernier segment, on n'utilise que $x_1,\dots,x_t$, on prévoit $x_{t+h}$ et on compare à la réalisation ; les paramètres sont ré-estimés tous les 20 jours. Les **concurrents** :
+
+* *Moyenne historique* (référence) et *zéro* (marche aléatoire des prix) ;
+* *ARMA de même ordre avec $d=0$* : isole l'apport de la **mémoire longue** ;
+* *FI(d) pur* et *FARIMA retenu*.
+
+Métriques : RMSE, MAE, **$R^2_{OOS}$** (gain d'EQM relatif à la référence : $>0$ = mieux), taux de bonne direction (testé contre la meilleure stratégie constante), tests de **Diebold-Mariano** (HLN) et de **Clark-West** (adapté aux modèles emboîtés — la moyenne est un cas particulier du FARIMA — pour lesquels le DM est conservateur).
+
+```{r}
+#| label: backtest
+#| cache: true
+modeles <- list(
+  modele_moyenne(),
+  modele_zero(),
+  modele_farima(p_ret, q_ret, d_fixe = 0, nom = paste0("ARMA(", p_ret, ",", q_ret, ") d=0")),
+  modele_farima(0, 0, nom = "FI(d) pur"),
+  modele_farima(p_ret, q_ret, nom = paste0("FARIMA(", p_ret, ",d,", q_ret, ")"))
+)
+bt <- backtest(y, modeles, h_set = c(1, 5), n_init = n_app, pas_refit = if (MODE_RAPIDE) 60 else 20, progression = FALSE)
+res_bt <- evaluer_tous_horizons(bt, ref = "Moyenne historique")
+tab(res_bt, digits = 5)
+```
+
+**Comment lire.**
+
+* `R2_OOS` > 0 et `CW_p` < 0,05 : le modèle bat significativement la moyenne ; `R2_OOS` ≤ 0 : il fait **pire** qu'une constante.
+* `DM_p` proche de 1 avec `CW_p` petit n'est pas contradictoire : le DM est conservateur pour des modèles emboîtés.
+* `hit_p` teste si la direction prévue bat la meilleure règle constante (par exemple « toujours à la hausse »).
+* Comparer **FARIMA contre ARMA de même ordre** est la mesure propre de l'apport de $d$.
+
+```{r}
+#| label: csfe
+#| fig-height: 4.2
+plot_csfe(bt, ref = "Moyenne historique", h = 1)
+```
+
+**Lecture du graphique.** Chaque courbe cumule le gain d'EQM sur la référence ; une pente positive = le modèle fait mieux à ce moment. Une courbe qui monte brusquement sur un épisode puis stagne signale une performance portée par quelques jours (souvent un krach ou un rebond), donc peu fiable.
+
+# Extension : la mémoire longue de la volatilité {#sec-vol}
+
+Si la section 4 a montré que $d$ est plus élevé sur $|r|$ que sur $r$, c'est la **volatilité** que le FARIMA peut prévoir. On modélise $|r_t|$ (positif, proxy de la volatilité) et on compare à des références usuelles (EWMA de RiskMetrics $\lambda=0{,}94$, moyenne mobile 22 jours).
+
+## Estimation sur $|r|$
+
+```{r}
+#| label: vol-fit
+a_app <- abs(y_app)
+fit_vol <- estim_mle_exact(a_app, 1, 1, init = estim_whittle(a_app, 1, 1))
+fit_vol
+```
+
+```{r}
+#| label: vol-verdict
+#| results: asis
+cat("**Lecture automatique :** ", interpreter_d(fit_vol$d, fit_vol$coefs$se[1]), "\n")
+```
+
+```{r}
+#| label: vol-diag
+#| fig-height: 4
+plot_acf_modele(fit_vol, 150, "sur |r| : FARIMA(1,d,1)")
+tab(test_d_nul(a_app, 1, 1, fit_libre = fit_vol), caption = "Test d = 0 sur |r|")
+```
+
+## Backtest de la prévision de $|r|$
+
+```{r}
+#| label: vol-backtest
+#| cache: true
+a_all <- abs(y)
+modeles_v <- list(modele_moyenne("Moyenne historique"), modele_mm(22), modele_ewma(0.94),
+                  modele_farima(1, 1, d_fixe = 0, nom = "ARMA(1,1) d=0"), modele_farima(1, 1, nom = "FARIMA(1,d,1)"))
+bt_v <- backtest(a_all, modeles_v, h_set = c(1, 5, 22), n_init = n_app, pas_refit = if (MODE_RAPIDE) 60 else 20, progression = FALSE)
+tab(evaluer_tous_horizons(bt_v, ref = "EWMA (0.94)"), digits = 5)
+```
+
+**Lecture.** Référence = EWMA. Le FARIMA devrait gagner surtout aux **horizons longs** (5 et 22 jours) : à court terme l'EWMA capte déjà l'inertie de la volatilité ; à long terme, la mémoire hyperbolique ramène la prévision vers la moyenne plus lentement, ce qui correspond mieux à la réalité des données. La cible $|r_{t+h}|$ est un proxy **bruité** de la volatilité : les EQM absolues sont élevées, seuls les écarts **relatifs** entre modèles sont informatifs. Les colonnes `hit_rate` et `hit_p` n'ont ici aucun sens ($|r|$ est toujours positif) : les ignorer.
+
+```{r}
+#| label: vol-csfe
+#| fig-height: 4.2
+plot_csfe(bt_v, ref = "EWMA (0.94)", h = 5)
+```
+
+# FARIMA-GARCH : moyenne et variance ensemble {#sec-garch}
+
+Le FARIMA décrit la moyenne conditionnelle ; il laisse $\mathrm{Var}(\varepsilon_t\mid\mathcal F_{t-1})$ constante. Les effets ARCH détectés plus haut imposent de modéliser aussi la variance. On ajuste, par vraisemblance de Student (queues épaisses), un FARIMA$(p,d,q)$ pour la moyenne combiné à :
+
+* **sGARCH(1,1)** — variance à mémoire courte ;
+* **gjrGARCH(1,1)** — avec asymétrie (effet de levier : une baisse augmente plus la volatilité qu'une hausse de même taille) ;
+* **fiGARCH(1,1)** — variance à **mémoire longue** (GARCH fractionnairement intégré), cohérent avec l'observation faite sur $|r|$.
+
+Cette section nécessite le package `rugarch` (ignorée sinon).
+
+```{r}
+#| label: garch-fit
+#| cache: true
+#| eval: !expr isTRUE(dispo[["rugarch"]])
+vars <- if (MODE_RAPIDE) c("sGARCH", "gjrGARCH") else c("sGARCH", "gjrGARCH", "fiGARCH")
+cmp_var <- comparer_variances(y_app, p_ret, q_ret, vars, "std")
+tab(cmp_var$table, caption = "Critères d'information (plus petit = meilleur)")
+meilleure <- cmp_var$table$variance[which.min(cmp_var$table$Bayes)]
+res_g <- cmp_var$fits[[meilleure]]
+cat("Variance retenue (BIC) :", meilleure, "\n")
+```
+
+```{r}
+#| label: garch-coefs
+#| eval: !expr isTRUE(dispo[["rugarch"]])
+tab(data.frame(parametre = rownames(res_g$coefs), res_g$coefs, check.names = FALSE),
+    caption = "Coefficients avec écarts-types robustes (sandwich)")
+```
+
+**Diagnostics sur les résidus standardisés $z_t=\hat\varepsilon_t/\hat\sigma_t$.** Après un bon GARCH, $z_t$ **et** $z_t^2$ doivent être non corrélés.
+
+```{r}
+#| label: garch-diag
+#| eval: !expr isTRUE(dispo[["rugarch"]])
+dg_g <- diagnostics_garch(res_g)
+tab(dg_g$portmanteau_z,  caption = "z : Ljung-Box et Lobato")
+tab(dg_g$portmanteau_z2, caption = "z^2 : Ljung-Box (effet ARCH résiduel)")
+tab(dg_g$arch, caption = "ARCH-LM sur z")
+```
+
+```{r}
+#| label: garch-vol
+#| fig-height: 3.8
+#| eval: !expr isTRUE(dispo[["rugarch"]])
+par_std()
+plot(dates_app, res_g$sigma * sqrt(CONFIG$jours_an) * 100, type = "l", col = COULEURS["bleu"],
+     xlab = "", ylab = "% annualisé", main = "Volatilité conditionnelle estimée")
+```
+
+## Prévision conditionnelle et Value-at-Risk
+
+```{r}
+#| label: garch-var
+#| eval: !expr isTRUE(dispo[["rugarch"]])
+tab(var_farima_garch(res_g, h = 10, niveaux = c(0.01, 0.05)), digits = 5, caption = "Prévision à 10 jours et VaR 99 % / 95 % (rendement logarithmique)")
+tab(backtest_var_insample(res_g, y_app, c(0.01, 0.05)), caption = "Test de Kupiec (couverture inconditionnelle) sur l'échantillon d'apprentissage")
+```
+
+**Lecture du test de Kupiec.** Le taux de violations observé doit être proche du taux théorique (1 % ou 5 %) ; une p-value petite signale une VaR mal calibrée. Ce test est *en échantillon* : un backtest hors échantillon (`rugarch::ugarchroll`) est plus exigeant et constitue la prochaine étape naturelle.
+
+# Synthèse et limites
+
+```{r}
+#| label: synthese
+#| results: asis
+cat("**Résumé automatique des résultats de ce rendu.**\n\n")
+cat("* Modèle de moyenne retenu (apprentissage) : FARIMA(", p_ret, ", d, ", q_ret, ") avec ", interpreter_d(fit_ret$d, fit_ret$coefs$se[fit_ret$coefs$param == "d"]), ".\n", sep = "")
+cat("* Test de ", td0$test[2], " : p = ", fmt_p(td0$p_value[2]), " -> ",
+    verdict_test(td0$p_value[2], rejet = "d = 0 rejeté (mémoire longue dans les rendements)",
+                 non_rejet = "d = 0 non rejeté (le FARIMA se réduit à l'ARMA pour la moyenne)"), ".\n", sep = "")
+cat("* Mémoire longue sur |r| (Whittle local) : ", interpreter_d(est_local_whittle(abs(y_app))$d, est_local_whittle(abs(y_app))$se), ".\n", sep = "")
+e1 <- res_bt[res_bt$horizon == 1, ]
+cat("* Backtest h = 1, R2 hors échantillon contre la moyenne : ",
+    paste0(e1$modele, " = ", signif(e1$R2_OOS, 3), collapse = " ; "), ".\n", sep = "")
+```
+
+**Ce que l'étude permet d'affirmer, et ce qu'elle ne permet pas.**
+
+1. *Mémoire longue de la moyenne* : à établir par le test $d=0$ et surtout par la comparaison **FARIMA contre ARMA de même ordre** en backtest. Une amélioration de l'ajustement en échantillon qui ne se retrouve pas hors échantillon n'a aucune valeur prédictive.
+2. *Mémoire longue de la volatilité* : c'est la propriété la mieux documentée pour les actifs financiers ; la prévision de $|r|$ et le FIGARCH l'exploitent.
+3. *Intervalles de prévision* : les intervalles du FARIMA seul sont inconditionnels et gaussiens ; pour le risque, utiliser le FARIMA-GARCH.
+4. *Limites* : (i) l'estimateur gaussien est consistant mais pas efficace sous bruit non gaussien ; (ii) la mémoire longue peut être **artificielle** (ruptures, changements de régime) : les fenêtres glissantes et la stabilité des paramètres sont les garde-fous ; (iii) le bootstrap tronque le MA($\infty$) ; (iv) le backtest n'intègre ni coûts de transaction ni exécution ; (v) un seul actif : généraliser à NVDA, BTC-USD, MRNA, URTH ne demande que de changer `CONFIG$ticker`.
+
+**Pistes d'extension.** Backtest hors échantillon de la VaR (`ugarchroll`) ; FARIMA avec lois asymétriques (skew-Student) ; modèles à ruptures (régimes) pour tester la fausse mémoire longue ; estimateur *exact local Whittle* (Shimotsu-Phillips) si $d$ pourrait dépasser 1/2 ; prévision multivariée (portefeuille).
+
+# Annexe : reproductibilité
+
+```{r}
+#| label: session
+cat("Graine :", CONFIG$graine, "\n"); cat("Modules chargés :", paste(modules, collapse = ", "), "\n")
+sessionInfo()
+```

@@ -1,0 +1,40 @@
+Je commence par vérifier ce qui est installé dans l'environnement (R, packages), pour pouvoir tester le code sur des données simulées avant de te le livrer.
+
+Point d'étape : 8 modules R sur 10 sont écrits (données, exploration, mémoire longue, noyau FARIMA, estimation gaussienne Whittle + MLE exact, sélection, diagnostics, prévision). Les formules clés ont été validées en Python, parce que R n'est pas installé dans mon environnement. Il me reste le backtest, les extensions (FARIMA-GARCH, bootstrap), le script de tests et le .qmd.
+
+Le projet FARIMA complet est prêt : 10 modules R, un script de tests, un README et le rapport analyse_FARIMA_TSLA.qmd. Je n'ai pas pu exécuter le code R, parce que R n'est pas installé dans mon environnement et que je n'ai pas de réseau pour l'y mettre.
+
+Ce qui est vérifié :
+
+Maths : j'ai validé en Python les formules clés : autocovariances, vraisemblance exacte, moyenne GLS, simulation, écarts-types de Whittle et prévision. Ces scripts sont dans tests/reference_python/.
+Syntaxe R : j'ai contrôlé l'équilibre des parenthèses et accolades dans tous les fichiers.
+Code R : il n'a jamais tourné. Lance d'abord source("tests/test_modules.R") (1 à 3 min, sans données de marché) : c'est la vraie validation. Si un test échoue, dis-moi lequel et je corrige.
+
+Le pipeline contient :
+
+Données : téléchargement avec repli sur data/TSLA.csv, puis contrôle qualité.
+Exploration : stationnarité, effets ARCH, corrélogrammes.
+Mémoire longue : les estimateurs GPH et local Whittle (le GSE gaussien de Robinson), le test de Lo, Hurst, et d glissant.
+Estimation FARIMA : Whittle et maximum de vraisemblance exact, avec la moyenne estimée par GLS (moindres carrés généralisés).
+Sélection : grille (p, q), FARIMA contre ARMA, test d = 0.
+Diagnostics : Lobato (portmanteau robuste au bruit faible), adéquation spectrale.
+Écarts-types : bootstrap par blocs.
+Prévision : rendements et prix, avec vérification par le prédicteur exact.
+Backtest : R² hors échantillon, Diebold-Mariano, Clark-West.
+Extensions : FARIMA-GARCH et FIGARCH (optionnels, via rugarch), VaR.
+
+Choix de méthode :
+
+J'ai lu « Fractionnaire Gauss » comme FARIMA estimé par quasi-vraisemblance gaussienne. Si tu pensais à autre chose, dis-le-moi.
+Les ordres (p, q) sont choisis sur les 80 % premiers jours seulement. Le dernier 20 % sert uniquement au backtest.
+Le rapport n'affirme aucun résultat chiffré. Il génère ses verdicts au rendu (par exemple « d non significatif »). Pour les rendements d'une action, d est probablement proche de 0 et la mémoire longue se trouve dans |r|. Le pipeline est écrit pour trancher dans les deux sens.
+
+À savoir avant de rendre le rapport :
+
+Durée : le rendu complet est long, à cause du maximum de vraisemblance exact, du bootstrap et des backtests. Mets MODE_RAPIDE <- TRUE pour un premier passage.
+Packages : fracdiff et rugarch sont optionnels. Sans eux, le contrôle croisé et la section FARIMA-GARCH sont sautés.
+
+Fichiers :
+
+
+
