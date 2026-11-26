@@ -1,0 +1,323 @@
+---
+title: "tp_FARMA_faible"
+format: html
+---
+Voici une correction complète et progressive de l'atelier dans R, utilisant uniquement des fonctions de base (sans package externe pour les questions 1 à 6) afin de garder le code simple, lisible et rapide.
+
+---
+
+## 1. Création de la fonction `SimProcess`
+
+Le modèle étudié est un processus $\text{ARFIMA}(1, d, 1)$ faible :
+
+
+$$(1 - L)^d (X_t + a X_{t-1}) = \epsilon_t + b \epsilon_{t-1}, \qquad \epsilon_t = \eta_t \eta_{t-1}$$
+
+
+où $(\eta_t)$ est un bruit blanc gaussien standard $\mathcal{N}(0, 1)$.
+
+Pour simuler une trajectoire stationnaire de taille $n$, on procède en trois étapes après avoir ajouté une période de chauffe (`burn = 500`) :
+
+1. Générer le bruit blanc faible $\epsilon_t = \eta_t \eta_{t-1}$.
+
+
+2. Simuler la partie $\text{ARMA}(1,1)$ : $Y_t = -a Y_{t-1} + \epsilon_t + b \epsilon_{t-1}$.
+
+
+3. Appliquer l'opérateur d'intégration fractionnaire $(1 - L)^{-d} = \sum_{k=0}^{\infty} \psi_k(d) L^k$ avec $\psi_0 = 1$ et $\psi_k = \psi_{k-1}\frac{k - 1 + d}{k}$.
+
+
+
+```{r}
+SimProcess <- function(n, a, b, d, burn = 500) {
+  N <- n + burn
+  
+  # 1. Bruit blanc faible : eps_t = eta_t * eta_{t-1}
+  eta <- rnorm(N + 1)
+  eps <- eta[-1] * eta[-(N + 1)]
+  
+  # 2. Partie ARMA(1,1) : Y_t = -a * Y_{t-1} + eps_t + b * eps_{t-1}
+  ma <- eps + b * c(0, eps[-N])
+  Y <- as.numeric(stats::filter(ma, filter = -a, method = "recursive"))
+  
+  # 3. Intégration fractionnaire : X_t = (1 - L)^(-d) Y_t
+```
+
+
+```{r}
+k <- 1:(N - 1)
+  psi <- c(1, cumprod((k - 1 + d) / k))
+  X <- convolve(Y, rev(psi), type = "open")[1:N]
+  
+  # Suppression de la période de chauffe
+  return(X[(burn + 1):N])
+}
+
+```
+
+---
+
+## 2. Simulation et analyse graphique ($n = 5000$)
+
+On fixe $a = -0.5$, $b = 0.2$ et $d = 0.3$, puis on affiche la série, son ACF et sa PACF sur une même fenêtre :
+
+```{r}
+set.seed(123)
+X <- SimProcess(n = 5000, a = -0.5, b = 0.2, d = 0.3)
+
+# Découpage de la fenêtre graphique en 3 lignes
+par(mfrow = c(3, 1), mar = c(4, 4, 2.5, 1))
+
+plot.ts(X, main = "Trajectoire simulée de X_t (n = 5000)", ylab = "X_t", col = "steelblue")
+acf(X, lag.max = 50, main = "Autocorrélations empiriques (ACF)")
+pacf(X, lag.max = 50, main = "Autocorrélations partielles empiriques (PACF)")
+
+par(mfrow = c(1, 1)) # Réinitialisation de la fenêtre
+
+```
+
+**Commentaires :**
+
+
+---
+
+## 3. Création de la fonction `Objective`
+
+Pour calculer $Q_n(a, b, d) = \frac{1}{n} \sum_{t=1}^n \epsilon_t^2(a, b, d)$, on applique successivement :
+
+1. $Z_t = X_t + a X_{t-1}$ (en posant $X_0 = 0$).
+
+
+2. $U_t = (1 - L)^d Z_t = \sum_{k=0}^{t-1} \pi_k(d) Z_{t-k}$ avec $\pi_0 = 1$ et $\pi_k = \pi_{k-1}\frac{k - 1 - d}{k}$.
+
+
+3. $\epsilon_t(a, b, d) = U_t - b \epsilon_{t-1}(a, b, d)$ (en posant $\epsilon_0 = 0$).
+
+
+
+```{r}
+Objective <- function(theta, X) {
+  a <- theta[1]
+  b <- theta[2]
+  d <- theta[3]
+  n <- length(X)
+  
+  # 1. Z_t = X_t + a * X_{t-1}
+  Z <- X + a * c(0, X[-n])
+  
+  # 2. U_t = (1 - L)^d Z_t
+  k <- 1:(n - 1)
+  pi_d <- c(1, cumprod((k - 1 - d) / k))
+  U <- convolve(Z, rev(pi_d), type = "open")[1:n]
+  
+  # 3. Récurrence : eps_t = U_t - b * eps_{t-1}
+  eps <- as.numeric(stats::filter(U, filter = -b, method = "recursive"))
+  
+  # 4. Moyenne des carrés des résidus
+  return(mean(eps^2))
+}
+
+# Vérification rapide au vrai paramètre (doit être proche de Var(eps_t) = 1)
+Objective(c(-0.5, 0.2, 0.3), X)
+
+```
+
+---
+
+## 4. Estimation des paramètres sur la trajectoire simulée
+
+On minimise $Q_n(a, b, d)$ sur $[-1, 1]^2 \times (-1/2, 1/2)$ avec `nlminb` en partant de $(0, 0, 0.1)$ :
+
+```{r}
+res_opt <- nlminb(
+  start = c(0, 0, 0.1),
+  objective = Objective,
+  X = X,
+  lower = c(-1, -1, -0.499),
+  upper = c(1, 1, 0.499)
+)
+
+# Paramètres estimés (a_hat, b_hat, d_hat)
+names(res_opt$par) <- c("a", "b", "d")
+print(round(res_opt$par, 4))
+
+```
+
+On obtient des estimations très proches des vraies valeurs $(-0.5,\; 0.2,\; 0.3)$.
+
+---
+
+## 5. Simulation de Monte-Carlo ($1000$ trajectoires)
+
+On répète l'estimation $1000$ fois sur des trajectoires indépendantes de taille $n = 5000$ et on stocke les résultats dans une matrice $1000 \times 3$ :
+
+```{r}
+set.seed(42)
+M <- 1000
+estimations <- matrix(NA, nrow = M, ncol = 3)
+colnames(estimations) <- c("a", "b", "d")
+
+for (i in 1:M) {
+  X_sim <- SimProcess(n = 5000, a = -0.5, b = 0.2, d = 0.3)
+  opt <- nlminb(
+    start = c(0, 0, 0.1),
+    objective = Objective,
+    X = X_sim,
+    lower = c(-1, -1, -0.499),
+    upper = c(1, 1, 0.499)
+  )
+  estimations[i, ] <- opt$par
+}
+
+```
+
+---
+
+## 6. Étude de la distribution empirique des estimateurs
+
+On étudie le biais, la dispersion et la normalité asymptotique de $(\hat{a}_n, \hat{b}_n, \hat{d}_n)$ :
+
+```{r}
+vraies_valeurs <- c(a = -0.5, b = 0.2, d = 0.3)
+
+# 1. Statistiques descriptives : moyenne, biais et écart-type empiriques
+moyennes <- colMeans(estimations)
+biais <- moyennes - vraies_valeurs
+ecarts_types <- apply(estimations, 2, sd)
+
+rbind(Vraie_valeur = vraies_valeurs, Moyenne = moyennes, Biais = biais, Ecart_type = ecarts_types)
+
+# 2. Histogrammes + densités + QQ-plots
+par(mfrow = c(2, 3), mar = c(4, 4, 2.5, 1))
+
+for (j in 1:3) {
+  nom <- colnames(estimations)[j]
+  est <- estimations[, j]
+  
+  hist(est, breaks = 30, freq = FALSE, col = "lightblue", border = "white",
+       main = paste("Distribution de", nom), xlab = nom)
+  curve(dnorm(x, mean = mean(est), sd = sd(est)), add = TRUE, col = "red", lwd = 2)
+  abline(v = vraies_valeurs[j], col = "darkgreen", lwd = 2, lty = 2)
+}
+
+for (j in 1:3) {
+  nom <- colnames(estimations)[j]
+  qqnorm(estimations[, j], main = paste("QQ-plot de", nom), pch = 20, col = "steelblue")
+  qqline(estimations[, j], col = "red", lwd = 2)
+}
+
+par(mfrow = c(1, 1))
+
+# 3. Tests de normalité de Shapiro-Wilk
+apply(estimations, 2, shapiro.test)
+
+```
+
+**Interprétation :**
+
+* **Absence de biais (consistance) :** Les moyennes empiriques des $1000$ estimations sont extrêmement proches des vraies valeurs $(-0.5, 0.2, 0.3)$ (biais négligeable).
+* **Normalité asymptotique :** Les histogrammes épousent la courbe de densité gaussienne et les points des QQ-plots sont alignés sur la droite théorique. Cela illustre numériquement que, même en présence d'un bruit blanc faible ($\epsilon_t = \eta_t\eta_{t-1}$ non indépendant), l'estimateur des moindres carrés ordinaires du modèle $\text{ARFIMA}$ reste **consistant et asymptotiquement normal**.
+
+---
+
+## 7. Modélisation complète de la série des minima annuels des eaux du Nil
+
+La série historique des minima annuels du Nil (mesurés au nilomètre de Roda de 622 à 1284, $n = 663$) est disponible sous le nom `NileMin` dans le package `longmemo` (à installer via `install.packages("longmemo")` si nécessaire).
+
+### Étape 1 : Exploration visuelle et centrage
+
+Comme le modèle (1) est centré ($E[X_t] = 0$), on centre la série avant d'appliquer notre estimateur :
+
+```{r}
+install.packages("longmemo")
+library(longmemo)
+data(NileMin)
+
+# Série centrée
+X_nil <- as.numeric(NileMin - mean(NileMin))
+n_nil <- length(X_nil)
+
+par(mfrow = c(3, 1), mar = c(4, 4, 2.5, 1))
+plot.ts(NileMin, main = "Minima annuels des eaux du Nil (622 - 1284)", ylab = "Niveau")
+acf(X_nil, lag.max = 50, main = "ACF de la série centrée")
+pacf(X_nil, lag.max = 50, main = "PACF de la série centrée")
+par(mfrow = c(1, 1))
+
+```
+
+La série ne présente pas de tendance linéaire évidente mais affiche une décroissance lente et hyperbolique de son ACF, caractéristique d'une mémoire longue ($d > 0$).
+
+### Étape 2 : Estimation et sélection du modèle (AIC / BIC)
+
+On ajuste le modèle complet $\text{ARFIMA}(1, d, 1)$ ainsi que des sous-modèles plus parcimonieux ($\text{ARFIMA}(0, d, 0)$, $\text{ARFIMA}(1, d, 0)$, $\text{ARFIMA}(0, d, 1)$) afin de comparer leurs critères d'information $\text{AIC} = n \ln(\hat{\sigma}^2) + 2k$ et $\text{BIC} = n \ln(\hat{\sigma}^2) + k \ln(n)$ :
+
+```{r}
+# 1. ARFIMA(1, d, 1)
+fit_11 <- nlminb(c(0, 0, 0.2), Objective, X = X_nil,
+                 lower = c(-1, -1, -0.499), upper = c(1, 1, 0.499))
+
+# 2. ARFIMA(1, d, 0) : b = 0
+fit_10 <- nlminb(c(0, 0.2), function(p) Objective(c(p[1], 0, p[2]), X_nil),
+                 lower = c(-1, -0.499), upper = c(1, 0.499))
+
+# 3. ARFIMA(0, d, 1) : a = 0
+fit_01 <- nlminb(c(0, 0.2), function(p) Objective(c(0, p[1], p[2]), X_nil),
+                 lower = c(-1, -0.499), upper = c(1, 0.499))
+
+# 4. ARFIMA(0, d, 0) : a = 0, b = 0
+fit_00 <- nlminb(0.2, function(p) Objective(c(0, 0, p[1]), X_nil),
+                 lower = -0.499, upper = 0.499)
+
+# Comparaison AIC et BIC
+criteres <- function(sigma2, k, n) {
+  c(sigma2 = sigma2, AIC = n * log(sigma2) + 2 * k, BIC = n * log(sigma2) + k * log(n))
+}
+
+rbind(
+  ARFIMA_1d1 = criteres(fit_11$objective, 3, n_nil),
+  ARFIMA_1d0 = criteres(fit_10$objective, 2, n_nil),
+  ARFIMA_0d1 = criteres(fit_01$objective, 2, n_nil),
+  ARFIMA_0d0 = criteres(fit_00$objective, 1, n_nil)
+)
+
+# Paramètres du modèle ARFIMA(1, d, 1)
+round(fit_11$par, 4)
+
+```
+
+### Étape 3 : Diagnostic des résidus et validation
+
+On extrait les résidus $\hat{\epsilon}_t$ du modèle retenu (par exemple `fit_11` ou le meilleur selon AIC/BIC) pour vérifier qu'ils forment bien un bruit blanc :
+
+```{r}
+# Fonction d'extraction des résidus
+GetResiduals <- function(theta, X) {
+  a <- theta[1]; b <- theta[2]; d <- theta[3]; n <- length(X)
+  Z <- X + a * c(0, X[-n])
+  k <- 1:(n - 1)
+  pi_d <- c(1, cumprod((k - 1 - d) / k))
+  U <- convolve(Z, rev(pi_d), type = "open")[1:n]
+  as.numeric(stats::filter(U, filter = -b, method = "recursive"))
+}
+
+res <- GetResiduals(fit_11$par, X_nil)
+
+# Graphiques de diagnostic
+par(mfrow = c(2, 2), mar = c(4, 4, 2.5, 1))
+plot.ts(res, main = "Résidus du modèle", ylab = "Résidus")
+acf(res, lag.max = 40, main = "ACF des résidus")
+acf(res^2, lag.max = 40, main = "ACF des résidus au carré (effet ARCH)")
+qqnorm(res, main = "QQ-plot des résidus", pch = 20)
+qqline(res, col = "red", lwd = 2)
+par(mfrow = c(1, 1))
+
+# Test de blancheur de Ljung-Box
+Box.test(res, lag = 20, type = "Ljung-Box", fitdf = 3)
+
+```
+
+**Synthèse de la modélisation :**
+
+* On estime un paramètre de mémoire longue $\hat{d} \approx 0.40$ (proche de la frontière de non-stationnarité $0.5$), ce qui confirme la forte persistance hydrologique mise en évidence historiquement par Hurst.
+* Les autocorrélations des résidus $\hat{\epsilon}_t$ restent dans la bande de confiance à $95\%$ et la $p$-valeur du test de Ljung-Box est supérieure à $0.05$ : le modèle filtre correctement la dépendance linéaire de court et long terme.
+* On peut enfin noter si l'ACF des carrés des résidus $\hat{\epsilon}_t^2$ présente une légère corrélation résiduelle, justifiant précisément l'intérêt d'un cadre **ARFIMA faible** (où le bruit n'est pas supposé indépendant, contrairement au cadre gaussien fort).

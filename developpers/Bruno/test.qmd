@@ -113,6 +113,11 @@ X_t <- rendements
 
 
 ```{r}
+ArchTest
+```
+
+
+```{r}
 # Test d'Engle (ARCH-LM) pour confirmer la présence d'hétéroscédasticité conditionnelle
 arch_test <- ArchTest(X_t, lags = 12)
 print(arch_test)
@@ -131,7 +136,6 @@ par(mfrow = c(1, 1))
 L'ACF et PACF ne présentant de forme assez sympa, on choisie des valeurs parcimonieuses pour p_max et q_max
 
 ```{r}
-
 p_max <- 2
 q_max <- 2
 
@@ -204,7 +208,10 @@ for (p in 1:p_max) {      # p >= 1 requis pour avoir un effet ARCH/GARCH
     }
   }
 }
+```
 
+
+```{r}
 # ==============================================================================
 # 5. FILTRAGE ET SÉLECTION DU MODÈLE OPTIMAL
 # ==============================================================================
@@ -232,7 +239,10 @@ p_opt <- modeles_valides$p[1]
 q_opt <- modeles_valides$q[1]
 
 cat(sprintf("\n>>> MEILLEUR MODÈLE SÉLECTIONNÉ : GARCH(%d, %d) <<<\n", p_opt, q_opt))
+```
 
+
+```{r}
 # ==============================================================================
 # 6. ESTIMATION FINALE ET DIAGNOSTICS COMPLETS DU MEILLEUR MODÈLE
 # ==============================================================================
